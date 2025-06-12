@@ -1,10 +1,19 @@
 import express from "express"
 import cors from "cors"
 import multer from "multer"
-import dotenv from "dotenv"
 import { Queue, Worker } from 'bullmq'
-dotenv.config()
 import axios from "axios"
+import fs from "fs"
+import path from "path"
+import Mux from '@mux/mux-node';
+
+import {uploadUrl,secretKey,muxTokenId} from "./config"
+
+
+const mux = new Mux({
+    tokenId: muxTokenId,
+    tokenSecret: secretKey
+});
 
 
 const uploadQueue = new Queue('video-upload', {
@@ -22,30 +31,57 @@ const uploadQueue = new Queue('video-upload', {
 
 const uploadWorker = new Worker("video-upload", async (job) => {
     const { fileBuffer, mimetype, videoId } = job.data;
+
     try {
-        const uploadUrl = await mux.video.uploads.create({
-            new_asset_settings: {
-                playback_policies: ["public"],
-                video_quality: 'basic',
-            },
-            cors_origin: "*"
+        const tempDir = path.join(__dirname, "..", "temp");
+        if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
+        const tempFilePath = path.join(tempDir, `${videoId}.mp4`);
+        fs.writeFileSync(tempFilePath, Buffer.from(fileBuffer.data));
+
+        const upload = await mux.video.uploads.create({
+            new_asset_settings : {playback_policies : ["public"], video_quality : "plus"},
+            cors_origin : "*"
         })
 
-        const uploadResponse = await axios.put(uploadUrl.url, fileBuffer, {
-            headers: {
+        const fileStream = fs.createReadStream(tempFilePath);
+        const fileStats = fs.statSync(tempFilePath);
+
+        const uploadResponse = await axios.put(upload.url, fileStream, {
+            headers : {
+                'Content-Length': fileStats.size,
                 'Content-Type': mimetype
             }
-        });
+        })
 
-        const upload = await mux.video.uploads.retrieve(uploadUrl.id);
-        const asset = await mux.video.assets.retrieve(upload.asset_id!);
-        const playbackId = asset.playback_ids?.[0]?.id;
-        const playbackUrl = playbackId ? `https://stream.mux.com/${playbackId}.m3u8` : null;
-        const thumbnailUrl = playbackId ? `https://image.mux.com/${playbackId}/thumbnail.png` : null;
-        console.log(playbackUrl , thumbnailUrl);
-        // await axios.post("http://localhost:3000/api/update-video", {
-        //     playbackUrl, thumbnailUrl
-        // })
+        console.log('File uploaded successfully');
+
+        const startTime = Date.now();
+        while (Date.now() - startTime < 300000) {
+            const retrieveUpload = await mux.video.uploads.retrieve(upload.id);
+            if (retrieveUpload.asset_id) {
+                const asset = await mux.video.assets.retrieve(retrieveUpload.asset_id);
+                if (asset.status === "ready") {
+                    const playBackIds = asset.playback_ids;
+                    if (playBackIds) {
+                        const playbackUrl = `https://stream.mux.com/${playBackIds[0].id}.m3u8`
+                        const thumbnailUrl = `https://image.mux.com/${playBackIds[0].id}/thumbnail.jpg`;
+
+                        await axios.post(uploadUrl!, {
+                            playbackUrl, thumbnailUrl,videoId
+                        })
+
+                        break;
+                    }
+                }
+                else {
+                    console.log("asset status",asset.status);
+                }
+            }
+            else {
+                console.log("upload status",retrieveUpload.status);
+            }
+        }
+
     } catch (e) {
         console.log(e);
     }
@@ -63,11 +99,7 @@ uploadWorker.on('progress', (job, progress) => {
     console.log(`Upload job ${job.id} progress: ${progress}%`);
 });
 
-import Mux from '@mux/mux-node';
-const mux = new Mux({
-    tokenId: process.env.MUX_TOKEN_ID,
-    tokenSecret: process.env.MUX_SECRET_KEY
-});
+
 
 const app = express();
 app.use(cors());
@@ -84,8 +116,12 @@ app.post("/api/v1/upload", async (req, res) => {
 
     try {
 
+     //   fs.writeFileSync("debug.mp4", file?.buffer!)
+
+    //   console.log("First 4 bytes:", fileBuffer?.slice(0, 4));
+
         const job = await uploadQueue.add('process-upload', {
-            fileBuffer: Array.from(file?.buffer!),
+            fileBuffer: file?.buffer!,
             mimetype: file?.mimetype,
             videoId: videoId,
         }, {
