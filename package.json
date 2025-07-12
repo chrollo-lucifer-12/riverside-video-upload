@@ -6,6 +6,7 @@
   "dependencies": {
     "@ffprobe-installer/ffprobe": "^2.1.2",
     "@mux/mux-node": "^11.1.0",
+    "@supabase/supabase-js": "^2.50.5",
     "@types/cors": "^2.8.18",
     "@types/express": "^5.0.2",
     "@types/ffmpeg": "^1.0.7",
@@ -14,7 +15,7 @@
     "axios": "^1.9.0",
     "bullmq": "^5.53.2",
     "cors": "^2.8.5",
-    "dotenv": "^16.5.0",
+    "dotenv": "^17.2.0",
     "express": "^5.1.0",
     "ffmpeg": "^0.0.4",
     "ffmpeg-static": "^5.2.0",

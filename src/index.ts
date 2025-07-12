@@ -2,22 +2,69 @@ import express from "express"
 import cors from "cors"
 import multer from "multer"
 import { Queue, Worker } from 'bullmq'
-import axios from "axios"
 import fs from "fs"
 import path from "path"
-import Mux from '@mux/mux-node';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import ffmpegPath from 'ffmpeg-static';
 import ffprobePath from '@ffprobe-installer/ffprobe';
+import {supabase} from "./supabaseClient"
 
-import {uploadUrl,secretKey,muxTokenId} from "./config"
+const getContentType = (filename: string) => {
+    if (filename.endsWith('.aac')) return 'audio/aac';
+    if (filename.endsWith('.mp4')) return 'video/mp4';
+    return 'application/octet-stream';
+};
 
+const uploadToSupabase = async (filePath: string, bucketName: string, destFileName: string, videoId : string) => {
+    const fileBuffer = fs.readFileSync(filePath);
+    const contentType = getContentType(destFileName);
 
-// const mux = new Mux({
-//     tokenId: muxTokenId,
-//     tokenSecret: secretKey
-// });
+    const { error, data } = await supabase.storage
+        .from(bucketName)
+        .upload(destFileName, fileBuffer, {
+            contentType: contentType,
+            upsert: true
+        });
+
+    if (error) {
+        console.error(`❌ Failed to upload ${destFileName}:`, error.message);
+    } else {
+        console.log(`✅ Uploaded ${destFileName} to Supabase`);
+        const { data } = supabase.storage.from(bucketName).getPublicUrl(destFileName);
+        await supabase.from("VideoAssets").insert([
+            {
+                type : contentType == "audio/aac" ? "AUDIO" : "VIDEO",
+                url : data.publicUrl,
+                mediaId : videoId
+            }
+        ])
+    }
+};
+
+const updateMetadata = async (filePath : string, bucketName : string, destFileName : string, videoId : string, type : "preview_url" | "full_url") => {
+    const fileBuffer = fs.readFileSync(filePath);
+    const contentType = getContentType(destFileName);
+
+    const { error, data } = await supabase.storage
+        .from(bucketName)
+        .upload(destFileName, fileBuffer, {
+            contentType: contentType,
+            upsert: true
+        });
+
+    if (error) {
+        console.error(`❌ Failed to upload ${destFileName}:`, error.message);
+    } else {
+        console.log(`✅ Uploaded ${destFileName} to Supabase`);
+        const { data } = supabase.storage.from(bucketName).getPublicUrl(destFileName);
+        await supabase
+            .from("Metadata")
+            .update({ [type]: data.publicUrl })
+            .eq("mediaId", videoId);
+    }
+}
+
 const execPromise = promisify(exec);
 
 const uploadQueue = new Queue('video-upload', {
@@ -48,48 +95,46 @@ const uploadWorker = new Worker("video-upload", async (job) => {
 
         const metadata = JSON.parse(stdout);
 
-        console.log("metadata", metadata)
-
         const audioStreams = metadata.streams.filter((s: any) => s.codec_type === 'audio');
         const videoStreams = metadata.streams.filter((s: any) => s.codec_type === 'video');
-        const subtitleStreams = metadata.streams.filter((s: any) => s.codec_type === 'subtitle');
 
-        console.log('audioStreams:', audioStreams.length);
-        console.log('videoStreams:', videoStreams.length);
-        console.log('subtitleStreams:', subtitleStreams.length);
+        const bucket = 'uploads';
 
         for (let i = 0; i < audioStreams.length; i++) {
             const out = `track${i}.aac`;
             const cmd = `"${ffmpegPath}" -i "${tempFilePath}" -map 0:a:${i} -c copy "${out}"`;
             await execPromise(cmd);
+            await uploadToSupabase(out, bucket, `audio/${videoId}/track${i}.aac`, videoId);
             console.log(`✅ Extracted audio track ${i} → ${out}`);
         }
 
-        // 🎥 Extract video + audio combinations
         for (let i = 0; i < videoStreams.length; i++) {
             const audioIndex = i < audioStreams.length ? i : 0;
             const out = `combined_track${i}.mp4`;
             const cmd = `"${ffmpegPath}" -i "${tempFilePath}" -map 0:v:${i} -map 0:a:${audioIndex} -c copy "${out}"`;
             await execPromise(cmd);
+            await uploadToSupabase(out, bucket, `combined/${videoId}/combined_track${i}.mp4`, videoId);
             console.log(`✅ Extracted video+audio track ${i} → ${out}`);
         }
-
 
         const previewOut = path.join(tempDir, `preview_360p.mp4`);
         await execPromise(
             `"${ffmpegPath}" -i "${tempFilePath}" -vf "scale=640:-2" -c:a aac -b:a 128k -c:v libx264 -preset fast "${previewOut}"`
         );
+        await updateMetadata(previewOut, bucket, `previews/${videoId}.mp4`, videoId, "preview_url");
         console.log(`🎞️ Transcoded preview → ${previewOut}`);
 
-        // 🎥 Transcode to 1080p for download (if not already 1080p)
         const fullOut = path.join(tempDir, `full_1080p.mp4`);
         await execPromise(
             `"${ffmpegPath}" -i "${tempFilePath}" -vf "scale=1920:-2" -c:a aac -b:a 192k -c:v libx264 -preset slow "${fullOut}"`
         );
+        await updateMetadata(fullOut, bucket, `full/${videoId}.mp4`, videoId, "full_url");
         console.log(`📽️ Transcoded full HD → ${fullOut}`);
 
 
-
+        await supabase.from("Media").update({
+            isProcessing : false
+        }).eq("id", videoId)
 
     } catch (e) {
         console.log(e);
