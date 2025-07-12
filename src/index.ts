@@ -6,15 +6,19 @@ import axios from "axios"
 import fs from "fs"
 import path from "path"
 import Mux from '@mux/mux-node';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import ffmpegPath from 'ffmpeg-static';
+import ffprobePath from '@ffprobe-installer/ffprobe';
 
 import {uploadUrl,secretKey,muxTokenId} from "./config"
 
 
-const mux = new Mux({
-    tokenId: muxTokenId,
-    tokenSecret: secretKey
-});
-
+// const mux = new Mux({
+//     tokenId: muxTokenId,
+//     tokenSecret: secretKey
+// });
+const execPromise = promisify(exec);
 
 const uploadQueue = new Queue('video-upload', {
     connection : {url : "redis://localhost:6379"},
@@ -38,49 +42,54 @@ const uploadWorker = new Worker("video-upload", async (job) => {
         const tempFilePath = path.join(tempDir, `${videoId}.mp4`);
         fs.writeFileSync(tempFilePath, Buffer.from(fileBuffer.data));
 
-        const upload = await mux.video.uploads.create({
-            new_asset_settings : {playback_policies : ["public"], video_quality : "plus"},
-            cors_origin : "*"
-        })
+        const { stdout } = await execPromise(
+            `"${ffprobePath.path}" -v quiet -print_format json -show_streams "${tempFilePath}"`
+        );
 
-        const fileStream = fs.createReadStream(tempFilePath);
-        const fileStats = fs.statSync(tempFilePath);
+        const metadata = JSON.parse(stdout);
 
-        const uploadResponse = await axios.put(upload.url, fileStream, {
-            headers : {
-                'Content-Length': fileStats.size,
-                'Content-Type': mimetype
-            }
-        })
+        console.log("metadata", metadata)
 
-        console.log('File uploaded successfully');
+        const audioStreams = metadata.streams.filter((s: any) => s.codec_type === 'audio');
+        const videoStreams = metadata.streams.filter((s: any) => s.codec_type === 'video');
+        const subtitleStreams = metadata.streams.filter((s: any) => s.codec_type === 'subtitle');
 
-        const startTime = Date.now();
-        while (Date.now() - startTime < 300000) {
-            const retrieveUpload = await mux.video.uploads.retrieve(upload.id);
-            if (retrieveUpload.asset_id) {
-                const asset = await mux.video.assets.retrieve(retrieveUpload.asset_id);
-                if (asset.status === "ready") {
-                    const playBackIds = asset.playback_ids;
-                    if (playBackIds) {
-                        const playbackUrl = `https://stream.mux.com/${playBackIds[0].id}.m3u8`
-                        const thumbnailUrl = `https://image.mux.com/${playBackIds[0].id}/thumbnail.jpg`;
+        console.log('audioStreams:', audioStreams.length);
+        console.log('videoStreams:', videoStreams.length);
+        console.log('subtitleStreams:', subtitleStreams.length);
 
-                        await axios.post(uploadUrl!, {
-                            playbackUrl, thumbnailUrl,videoId
-                        })
-
-                        break;
-                    }
-                }
-                else {
-                    console.log("asset status",asset.status);
-                }
-            }
-            else {
-                console.log("upload status",retrieveUpload.status);
-            }
+        for (let i = 0; i < audioStreams.length; i++) {
+            const out = `track${i}.aac`;
+            const cmd = `"${ffmpegPath}" -i "${tempFilePath}" -map 0:a:${i} -c copy "${out}"`;
+            await execPromise(cmd);
+            console.log(`✅ Extracted audio track ${i} → ${out}`);
         }
+
+        // 🎥 Extract video + audio combinations
+        for (let i = 0; i < videoStreams.length; i++) {
+            const audioIndex = i < audioStreams.length ? i : 0;
+            const out = `combined_track${i}.mp4`;
+            const cmd = `"${ffmpegPath}" -i "${tempFilePath}" -map 0:v:${i} -map 0:a:${audioIndex} -c copy "${out}"`;
+            await execPromise(cmd);
+            console.log(`✅ Extracted video+audio track ${i} → ${out}`);
+        }
+
+
+        const previewOut = path.join(tempDir, `preview_360p.mp4`);
+        await execPromise(
+            `"${ffmpegPath}" -i "${tempFilePath}" -vf "scale=640:-2" -c:a aac -b:a 128k -c:v libx264 -preset fast "${previewOut}"`
+        );
+        console.log(`🎞️ Transcoded preview → ${previewOut}`);
+
+        // 🎥 Transcode to 1080p for download (if not already 1080p)
+        const fullOut = path.join(tempDir, `full_1080p.mp4`);
+        await execPromise(
+            `"${ffmpegPath}" -i "${tempFilePath}" -vf "scale=1920:-2" -c:a aac -b:a 192k -c:v libx264 -preset slow "${fullOut}"`
+        );
+        console.log(`📽️ Transcoded full HD → ${fullOut}`);
+
+
+
 
     } catch (e) {
         console.log(e);
@@ -115,11 +124,6 @@ app.post("/api/v1/upload", async (req, res) => {
     const videoId = req.body.videoId;
 
     try {
-
-     //   fs.writeFileSync("debug.mp4", file?.buffer!)
-
-    //   console.log("First 4 bytes:", fileBuffer?.slice(0, 4));
-
         const job = await uploadQueue.add('process-upload', {
             fileBuffer: file?.buffer!,
             mimetype: file?.mimetype,
